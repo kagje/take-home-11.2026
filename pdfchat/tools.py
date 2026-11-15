@@ -20,10 +20,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-import pymupdf
-
 from pdfchat import config
-from pdfchat.ingest import Document, count_tokens, encoder
+from pdfchat.ingest import Document, count_tokens, encoder, render_page
 from pdfchat.library import Library
 
 log = logging.getLogger(__name__)
@@ -181,15 +179,10 @@ class Toolbox:
     async def view_page(self, document: str, page: int) -> ToolResult:
         doc = self._doc(document)
         self._check_page(doc, page)
-        png = await asyncio.to_thread(render_page, doc, page)
+        png = await asyncio.to_thread(render_page, doc, page, config.VIEW_PAGE_DPI)
         data_url = "data:image/png;base64," + base64.b64encode(png).decode()
         output = [
             {"type": "input_text", "text": f"Image of {cite(doc, page)}:"},
             {"type": "input_image", "image_url": data_url, "detail": "high"},
         ]
         return ToolResult(output, f"{doc.name} p.{page}", image=png, pages=frozenset({(doc.id, page)}))
-
-
-def render_page(doc: Document, page: int, dpi: int = config.VIEW_PAGE_DPI) -> bytes:
-    with pymupdf.open(doc.path) as pdf:
-        return pdf[page - 1].get_pixmap(dpi=dpi).tobytes("png")

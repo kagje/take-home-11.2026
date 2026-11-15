@@ -117,7 +117,7 @@ def test_ingest_reads_pdf_page_labels(tmp_path: Path) -> None:
 
     doc = ingest_pdf(path)
     assert [p.label for p in doc.pages] == ["i", "ii", "1", "2", "3", "4"]
-    assert any("PDF page labels" in note for note in doc.notes)
+    assert doc.label_source == "PDF page labels"
 
 
 def test_page_ref_and_mapping() -> None:

@@ -70,3 +70,10 @@ PRICES = {
 # Hard cap on vision-OCR pages per document, to bound cost and latency.
 MAX_OCR_PAGES = 40
 OCR_DPI = 150
+# Pages OCR'd in parallel. gpt-6-luna takes ~10s per page, so serial OCR of 40
+# pages would take ~7 minutes; 8 at a time brings that to under a minute.
+OCR_CONCURRENCY = 8
+# Transcription needs no reasoning: "none" was ~40% faster than "low" with the
+# same accuracy (measured on the scanned sample). Not every model accepts
+# "none" (gpt-5-mini wants "minimal"), hence configurable.
+OCR_REASONING_EFFORT = os.getenv("OCR_REASONING_EFFORT", "none")

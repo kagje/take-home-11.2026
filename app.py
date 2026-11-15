@@ -18,8 +18,10 @@ from chainlit.utils import utc_now
 from pdfchat import config
 from pdfchat.agent import Agent, Completed, TextDelta, ToolFinished, ToolStarted
 from pdfchat.citations import UNVERIFIED, Citation, normalise
-from pdfchat.ingest import Document, IngestError, PageKind, ingest_pdf
+from pdfchat.ingest import Document, IngestError, format_ranges, ingest_pdf
 from pdfchat.library import Library
+from pdfchat.ocr import ocr_document
+from pdfchat.pagelabels import describe_mapping
 
 log = logging.getLogger(__name__)
 
@@ -34,13 +36,32 @@ def describe(doc: Document) -> str:
         f"**{doc.name}**: {len(doc.pages)} pages, ~{doc.token_count:,} tokens → strategy `{doc.strategy}`",
         "- " + ", ".join(f"{n} {k}" for k, n in kinds.items()),
     ]
-    if ocr := [p.number for p in doc.pages if p.needs_ocr]:
-        shown = ", ".join(map(str, ocr[:15])) + (" …" if len(ocr) > 15 else "")
-        lines.append(f"- pages needing OCR: {shown}")
-    if kinds[PageKind.TEXT] == 0:
-        lines.append("- ⚠️ no usable text layer at all")
-    lines += [f"- {n}" for n in doc.notes]
+    if ocr_done := [p.number for p in doc.pages if p.ocr]:
+        lines.append(f"- OCR'd pages: {format_ranges(ocr_done)}")
+    if ocr_needed := [p.number for p in doc.pages if p.needs_ocr]:
+        lines.append(f"- pages needing OCR: {format_ranges(ocr_needed)}")
+    if not any(p.text for p in doc.pages):
+        lines.append("- ⚠️ no usable text at all")
+    if doc.stripped_lines:
+        lines.append(f"- stripped {doc.stripped_lines} repeated header/footer lines")
+    if doc.label_source:
+        lines.append(
+            f"- page numbering differs from PDF positions (from {doc.label_source}): {describe_mapping(doc.pages)}"
+        )
+    lines += [f"- ⚠️ {n}" for n in doc.notes]
     return "\n".join(lines)
+
+
+async def ocr_with_progress(doc: Document) -> None:
+    todo = sum(p.needs_ocr for p in doc.pages)
+    async with cl.Step(name=f"OCR of {min(todo, config.MAX_OCR_PAGES)} page(s) in {doc.name}", type="llm") as step:
+
+        async def progress(done: int, total: int) -> None:
+            step.output = f"{done}/{total} pages"
+            await step.update()
+
+        count = await ocr_document(doc, progress=progress)
+        step.output = f"{count} page(s) transcribed" + "".join(f"\n⚠️ {n}" for n in doc.notes)
 
 
 async def ingest_element(element: Element, library: Library) -> None:
@@ -53,6 +74,9 @@ async def ingest_element(element: Element, library: Library) -> None:
             await cl.Message(f"Couldn't use **{element.name}**: {exc}").send()
             return
         step.output = describe(doc)
+
+    if any(p.needs_ocr for p in doc.pages):
+        await ocr_with_progress(doc)
 
     async with cl.Step(name=f"Indexing {doc.name}", type="embedding") as step:
         chunks = await library.add(doc)

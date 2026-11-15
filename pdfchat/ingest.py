@@ -19,7 +19,7 @@ import pymupdf
 import tiktoken
 
 from pdfchat import config
-from pdfchat.pagelabels import describe_mapping, resolve_labels
+from pdfchat.pagelabels import resolve_labels
 
 
 class IngestError(Exception):
@@ -41,11 +41,12 @@ class Strategy(StrEnum):
 @dataclass
 class Page:
     number: int  # 1-based position in the PDF; what tools and the model use
-    text: str
+    text: str  # cleaned text (running headers/footers removed); what gets indexed
     kind: PageKind
     image_coverage: float
     ocr: bool = False  # True once text came from vision OCR
     label: str | None = None  # printed page number, if known and != number (see pagelabels.py)
+    raw_text: str = ""  # text layer or OCR output before cleanup; `text`/`label` derive from it
 
     @property
     def needs_ocr(self) -> bool:
@@ -59,6 +60,9 @@ class Document:
     path: Path
     pages: list[Page]
     notes: list[str] = field(default_factory=list)  # warnings surfaced to the user
+    pdf_labels: list[str] = field(default_factory=list)  # /PageLabels as read from the file
+    label_source: str | None = None  # where printed page numbers came from, if any
+    stripped_lines: int = 0  # running header/footer lines removed
 
     # Cached: tokenising a 500-page document takes ~0.3s and the prompt builder
     # asks every turn. Call refresh() after changing page text (e.g. OCR).
@@ -201,7 +205,8 @@ def _validate(path: Path) -> bytes:
 
 def ingest_pdf(path: str | Path, name: str | None = None) -> Document:
     """Parse a PDF into a Document. CPU-bound and blocking: call it off the
-    event loop. Pages needing OCR are flagged but not OCR'd here (see ocr.py)."""
+    event loop. Pages needing OCR are flagged but not OCR'd here (see ocr.py).
+    Ingest itself never calls an API: it is fast, free and deterministic."""
     path = Path(path)
     data = _validate(path)
 
@@ -222,28 +227,57 @@ def ingest_pdf(path: str | Path, name: str | None = None) -> Document:
         # slower and, by sorting blocks top-to-bottom, interleaves the columns
         # of two-column layouts (papers, reports). Layout-aware parsing
         # (Docling/Marker) is the real fix; see README.
-        texts = [page.get_text("text") for page in doc]
+        raw = [page.get_text("text") for page in doc]
         coverages = [image_coverage(page) for page in doc]
         pdf_labels = [page.get_label() for page in doc]
 
-    # Before stripping: the printed page number is usually a running line.
-    labels, label_source = resolve_labels(pdf_labels, texts)
-    texts, removed = strip_running_lines(texts)
+    # Classify on stripped text: a scan whose text layer is only a running
+    # header is still a scan.
+    stripped, _ = strip_running_lines(raw)
     pages = [
-        Page(n, text, classify_page(text, cov), cov, label=label)
-        for n, (text, cov, label) in enumerate(zip(texts, coverages, labels, strict=True), start=1)
+        Page(n, "", classify_page(text, cov), cov, raw_text=raw_text)
+        for n, (raw_text, text, cov) in enumerate(zip(raw, stripped, coverages, strict=True), start=1)
     ]
     result = Document(
         id=hashlib.sha256(data).hexdigest()[:12],
         name=name or path.name,
         path=path,
         pages=pages,
+        pdf_labels=pdf_labels,
     )
-    if removed:
-        result.notes.append(f"stripped {removed} repeated header/footer lines")
-    if label_source:
-        result.notes.append(f"page numbering differs from PDF positions ({label_source}): {describe_mapping(pages)}")
-    # Junk text would only pollute the index; drop it until OCR replaces it.
-    for p in result.pages_of_kind(PageKind.GARBLED):
-        p.text = ""
+    clean_text(result)
     return result
+
+
+def clean_text(doc: Document) -> None:
+    """Derive every page's `text` and printed `label` from its `raw_text`.
+
+    Runs at ingest and again after OCR, so OCR'd pages get exactly the same
+    treatment as digital ones: running headers stripped, printed page numbers
+    detected (scanned documents have page numbers too)."""
+    raw = [p.raw_text for p in doc.pages]
+    # Labels first: the printed page number is usually one of the running lines.
+    labels, doc.label_source = resolve_labels(doc.pdf_labels, raw)
+    texts, doc.stripped_lines = strip_running_lines(raw)
+    for page, text, label in zip(doc.pages, texts, labels, strict=True):
+        page.label = label
+        # Junk text would only pollute the index; drop it until OCR replaces it.
+        page.text = "" if page.kind == PageKind.GARBLED and not page.ocr else text
+    doc.refresh()
+
+
+def render_page(doc: Document, page: int, dpi: int) -> bytes:
+    """PNG of one page (1-based). Used for view_page and OCR."""
+    with pymupdf.open(doc.path) as pdf:
+        return pdf[page - 1].get_pixmap(dpi=dpi).tobytes("png")
+
+
+def format_ranges(numbers: list[int]) -> str:
+    """[1,2,3,7,9,10] -> '1-3, 7, 9-10'"""
+    out: list[str] = []
+    for n in numbers:
+        if out and n == int(out[-1].split("-")[-1]) + 1:
+            out[-1] = f"{out[-1].split('-')[0]}-{n}"
+        else:
+            out.append(str(n))
+    return ", ".join(out)

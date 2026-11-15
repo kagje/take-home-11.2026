@@ -7,17 +7,23 @@ Usage:  uv run python scripts/ask.py samples/attention.pdf [more.pdf ...] -q "qu
 import argparse
 import asyncio
 import json
+import time
 
 from pdfchat.agent import Agent, Completed, TextDelta, ToolFinished, ToolStarted
 from pdfchat.citations import normalise
 from pdfchat.ingest import ingest_pdf
 from pdfchat.library import Library
+from pdfchat.ocr import ocr_document
 
 
 async def main(paths: list[str], questions: list[str]) -> None:
     library = Library()
     for path in paths:
         doc = await asyncio.to_thread(ingest_pdf, path)
+        if any(p.needs_ocr for p in doc.pages):
+            t0 = time.perf_counter()
+            n = await ocr_document(doc)
+            print(f"OCR'd {n} page(s) of {doc.name} in {time.perf_counter() - t0:.1f}s {doc.notes or ''}")
         await library.add(doc)
         print(f"loaded {doc.name}: {len(doc.pages)} pages, ~{doc.token_count:,} tokens")
     agent = Agent(library)

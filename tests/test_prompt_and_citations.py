@@ -4,8 +4,8 @@ import re
 from fakes import make_doc, make_library
 
 from pdfchat.citations import UNVERIFIED, normalise
-from pdfchat.ingest import PageKind
-from pdfchat.prompt import _ranges, build_instructions, select_in_context
+from pdfchat.ingest import PageKind, format_ranges
+from pdfchat.prompt import build_instructions, select_in_context
 
 # --- prompt ---------------------------------------------------------------------
 
@@ -43,8 +43,8 @@ def test_prompt_is_deterministic_for_prefix_caching() -> None:
 
 
 def test_ranges() -> None:
-    assert _ranges([1, 2, 3, 7, 9, 10]) == "1-3, 7, 9-10"
-    assert _ranges([]) == ""
+    assert format_ranges([1, 2, 3, 7, 9, 10]) == "1-3, 7, 9-10"
+    assert format_ranges([]) == ""
 
 
 # --- citations ------------------------------------------------------------------

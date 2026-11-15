@@ -11,10 +11,8 @@ prefix caching kicks in from the second turn on (cached input is 10x cheaper).
 
 from __future__ import annotations
 
-from collections import Counter
-
 from pdfchat import config
-from pdfchat.ingest import Document, PageKind
+from pdfchat.ingest import Document, PageKind, format_ranges
 from pdfchat.library import Library
 from pdfchat.pagelabels import describe_mapping
 
@@ -64,25 +62,16 @@ def in_context_pages(library: Library) -> set[tuple[str, int]]:
     return {(d.id, p.number) for d in library.docs.values() if d.id in chosen for p in d.pages if p.text}
 
 
-def _ranges(numbers: list[int]) -> str:
-    """[1,2,3,7,9,10] -> '1-3, 7, 9-10'"""
-    out: list[str] = []
-    for n in numbers:
-        if out and n == int(out[-1].split("-")[-1]) + 1:
-            out[-1] = f"{out[-1].split('-')[0]}-{n}"
-        else:
-            out.append(str(n))
-    return ", ".join(out)
-
-
 def _catalogue_entry(doc: Document, in_context: bool) -> str:
     mode = "IN CONTEXT" if in_context else "SEARCH-ONLY"
     line = f"- {doc.name} (id {doc.id}): {len(doc.pages)} pages, ~{doc.token_count:,} tokens, {mode}"
-    kinds = Counter(p.kind for p in doc.pages)
     if no_text := [p.number for p in doc.pages if not p.text and p.kind != PageKind.EMPTY]:
-        line += f". No extracted text on pages {_ranges(no_text)} (scanned/unreadable): use view_page"
-    elif kinds[PageKind.TEXT] == 0:
-        line += ". No text at all"
+        line += f". No extracted text on pages {format_ranges(no_text)} (scanned/unreadable): use view_page"
+    if ocr := [p.number for p in doc.pages if p.ocr and p.text]:
+        line += (
+            f". Text of pages {format_ranges(ocr)} comes from OCR and may contain recognition errors: "
+            "use view_page to check exact numbers, names or tables before relying on them"
+        )
     if mapping := describe_mapping(doc.pages):
         line += f". Printed page numbers: {mapping}"
     return line
