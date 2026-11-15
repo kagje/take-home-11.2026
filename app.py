@@ -1,13 +1,31 @@
-"""Chainlit entry point.  Run:  uv run chainlit run app.py -w"""
+"""Chainlit entry point.  Run:  uv run chainlit run app.py -w
+
+This file is only UI glue: upload handling, and rendering the agent's event
+stream (text deltas -> streamed message, tool calls -> steps, citations ->
+links that open the PDF at the cited page).
+"""
 
 import asyncio
+import json
+import logging
 from collections import Counter
 
 import chainlit as cl
+import openai
 from chainlit.element import Element
+from chainlit.utils import utc_now
 
+from pdfchat import config
+from pdfchat.agent import Agent, Completed, TextDelta, ToolFinished, ToolStarted
+from pdfchat.citations import UNVERIFIED, Citation, normalise
 from pdfchat.ingest import Document, IngestError, PageKind, ingest_pdf
 from pdfchat.library import Library
+
+log = logging.getLogger(__name__)
+
+# Chainlit file key of each uploaded PDF, so citation links can reference the
+# already-uploaded file instead of re-uploading a copy per citation.
+FILE_KEYS = "file_keys"
 
 
 def describe(doc: Document) -> str:
@@ -40,12 +58,87 @@ async def ingest_element(element: Element, library: Library) -> None:
         chunks = await library.add(doc)
         step.output = f"{chunks} chunks embedded and indexed" if chunks else "already indexed"
 
+    cl.user_session.get(FILE_KEYS)[doc.id] = element.chainlit_key
     await cl.Message(describe(doc)).send()
+
+
+def citation_elements(citations: list[Citation], file_keys: dict[str, str | None]) -> list[cl.Pdf]:
+    """One side-panel PDF link per citation.
+
+    display="side": Chainlit turns every occurrence of the element's name in the
+    message into a link that opens the PDF at `page` (longest names match
+    first, so "x.pdf p.12" beats "x.pdf p.1").
+
+    `path` is required by the constructor; `chainlit_key` (the id of the
+    already-uploaded file) stops Chainlit from storing a fresh copy of the
+    whole PDF for every citation."""
+    return [
+        cl.Pdf(
+            name=c.label,
+            page=c.page,
+            display="side",
+            mime="application/pdf",
+            path=str(c.doc.path),
+            chainlit_key=file_keys.get(c.doc.id),
+        )
+        for c in citations
+    ]
+
+
+def usage_footer(event: Completed, model: str) -> str:
+    u = event.usage
+    parts = [
+        f"{u.tool_calls} tool call{'' if u.tool_calls == 1 else 's'}",
+        f"{u.input_tokens + u.output_tokens:,} tokens ({u.cached_tokens:,} cached)",
+    ]
+    if (cost := u.cost(model)) is not None:
+        parts.append(f"${cost:.4f}")
+    return "\n\n*" + " · ".join(parts) + "*"
+
+
+async def answer(agent: Agent, question: str) -> None:
+    reply = cl.Message(content="")
+    steps: dict[str, cl.Step] = {}
+
+    async for event in agent.run(question):
+        match event:
+            case TextDelta(text=text):
+                await reply.stream_token(text)
+            case ToolStarted(call_id=call_id, name=name, arguments=arguments):
+                step = cl.Step(name=name, type="tool", show_input="json")
+                step.input = json.dumps(json.loads(arguments), indent=2)
+                step.start = utc_now()
+                await step.send()
+                steps[call_id] = step
+            case ToolFinished(call_id=call_id, result=result):
+                step = steps.pop(call_id)
+                step.output = result.summary
+                if result.image:
+                    step.elements = [cl.Image(name="page", content=result.image, display="inline", size="large")]
+                step.end = utc_now()
+                await step.update()
+            case Completed() as done:
+                # Replace the streamed text with the final answer: drops any
+                # "let me search..." preamble and canonicalises citations.
+                text, citations = normalise(done.text, agent.library, done.seen_pages)
+                if any(not c.verified for c in citations):
+                    text += f"\n\n⚠️ *{UNVERIFIED}: the assistant cited a page it never actually read. Double-check it.*"
+                footer = usage_footer(done, agent.model) if config.SHOW_USAGE else ""
+                reply.content = text + footer
+                try:
+                    reply.elements = citation_elements(citations, cl.user_session.get(FILE_KEYS))
+                except Exception:  # links are a nicety; never lose the answer over them
+                    log.exception("could not build citation links")
+                log.info("turn usage: %s", done.usage)
+    await reply.send()
 
 
 @cl.on_chat_start
 async def on_chat_start() -> None:
-    cl.user_session.set("library", Library())
+    library = Library()
+    cl.user_session.set("library", library)
+    cl.user_session.set("agent", Agent(library))
+    cl.user_session.set(FILE_KEYS, {})
     await cl.Message(
         "Hello there! Upload one or more PDFs (click upload or drag & drop), then ask questions about them."
     ).send()
@@ -61,13 +154,10 @@ async def on_message(message: cl.Message) -> None:
         if element.path and (element.mime == "application/pdf" or element.name.lower().endswith(".pdf")):
             await ingest_element(element, library)
 
-    if message.content.strip():
-        # Placeholder until the agent lands (step 3): show raw retrieval results.
-        hits = await library.index.search(message.content)
-        lines = [
-            f"- **{h.chunk.doc_name}** p{h.chunk.page} (dense #{h.dense_rank}, bm25 #{h.keyword_rank}): "
-            f"{' '.join(h.chunk.text.split())[:160]}…"
-            for h in hits
-        ]
-        body = "\n".join(lines) or "_nothing indexed_"
-        await cl.Message(f"Top search hits (agent comes in step 3):\n{body}").send()
+    if not message.content.strip():
+        return
+    try:
+        await answer(cl.user_session.get("agent"), message.content)
+    except openai.OpenAIError as exc:
+        log.exception("model call failed")
+        await cl.ErrorMessage(f"The model call failed: {exc}").send()

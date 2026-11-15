@@ -1,32 +1,11 @@
 import asyncio
-import hashlib
 import itertools
-from pathlib import Path
 
-import numpy as np
 import pytest
+from fakes import fake_embed, make_doc
 
 from pdfchat.index import Index, chunk_document, chunk_text, reciprocal_rank_fusion, tokenize
-from pdfchat.ingest import Document, Page, PageKind, count_tokens
-
-
-async def fake_embed(texts: list[str]) -> np.ndarray:
-    """Deterministic bag-of-words hashing embedder: texts sharing words are
-    similar. Lets us test search mechanics without calling the API."""
-    out = np.zeros((len(texts), 256), dtype=np.float32)
-    for row, text in enumerate(texts):
-        for word in tokenize(text):
-            out[row, int(hashlib.md5(word.encode()).hexdigest(), 16) % 256] += 1
-    return out / np.maximum(np.linalg.norm(out, axis=1, keepdims=True), 1e-9)
-
-
-def make_doc(doc_id: str, pages: list[str]) -> Document:
-    return Document(
-        id=doc_id,
-        name=f"{doc_id}.pdf",
-        path=Path(f"{doc_id}.pdf"),
-        pages=[Page(i + 1, t, PageKind.TEXT if t else PageKind.EMPTY, 0.0) for i, t in enumerate(pages)],
-    )
+from pdfchat.ingest import count_tokens
 
 
 def run(coro):

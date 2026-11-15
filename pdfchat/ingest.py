@@ -12,13 +12,14 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
-from functools import cache
+from functools import cache, cached_property
 from pathlib import Path
 
 import pymupdf
 import tiktoken
 
 from pdfchat import config
+from pdfchat.pagelabels import describe_mapping, resolve_labels
 
 
 class IngestError(Exception):
@@ -39,11 +40,12 @@ class Strategy(StrEnum):
 
 @dataclass
 class Page:
-    number: int  # 1-based, as humans cite pages
+    number: int  # 1-based position in the PDF; what tools and the model use
     text: str
     kind: PageKind
     image_coverage: float
     ocr: bool = False  # True once text came from vision OCR
+    label: str | None = None  # printed page number, if known and != number (see pagelabels.py)
 
     @property
     def needs_ocr(self) -> bool:
@@ -58,13 +60,19 @@ class Document:
     pages: list[Page]
     notes: list[str] = field(default_factory=list)  # warnings surfaced to the user
 
-    @property
+    # Cached: tokenising a 500-page document takes ~0.3s and the prompt builder
+    # asks every turn. Call refresh() after changing page text (e.g. OCR).
+    @cached_property
     def text(self) -> str:
         return "\n\n".join(f"[page {p.number}]\n{p.text}" for p in self.pages if p.text)
 
-    @property
+    @cached_property
     def token_count(self) -> int:
         return count_tokens(self.text)
+
+    def refresh(self) -> None:
+        for attr in ("text", "token_count"):
+            self.__dict__.pop(attr, None)
 
     @property
     def strategy(self) -> Strategy:
@@ -74,6 +82,16 @@ class Document:
 
     def pages_of_kind(self, kind: PageKind) -> list[Page]:
         return [p for p in self.pages if p.kind == kind]
+
+    def page_ref(self, first: int, last: int | None = None) -> str:
+        """A page (range) as shown to people: printed number first when known,
+        e.g. 'p.9 (PDF p.13)', else just 'p.13'."""
+        last = first if last is None else last
+        pdf = str(first) if last == first else f"{first}-{last}"
+        a, b = self.pages[first - 1].label, self.pages[last - 1].label
+        if a and b:
+            return f"p.{a if last == first else f'{a}-{b}'} (PDF p.{pdf})"
+        return f"p.{pdf}"
 
 
 @cache
@@ -206,11 +224,14 @@ def ingest_pdf(path: str | Path, name: str | None = None) -> Document:
         # (Docling/Marker) is the real fix; see README.
         texts = [page.get_text("text") for page in doc]
         coverages = [image_coverage(page) for page in doc]
+        pdf_labels = [page.get_label() for page in doc]
 
+    # Before stripping: the printed page number is usually a running line.
+    labels, label_source = resolve_labels(pdf_labels, texts)
     texts, removed = strip_running_lines(texts)
     pages = [
-        Page(n, text, classify_page(text, cov), cov)
-        for n, (text, cov) in enumerate(zip(texts, coverages, strict=True), start=1)
+        Page(n, text, classify_page(text, cov), cov, label=label)
+        for n, (text, cov, label) in enumerate(zip(texts, coverages, labels, strict=True), start=1)
     ]
     result = Document(
         id=hashlib.sha256(data).hexdigest()[:12],
@@ -220,6 +241,8 @@ def ingest_pdf(path: str | Path, name: str | None = None) -> Document:
     )
     if removed:
         result.notes.append(f"stripped {removed} repeated header/footer lines")
+    if label_source:
+        result.notes.append(f"page numbering differs from PDF positions ({label_source}): {describe_mapping(pages)}")
     # Junk text would only pollute the index; drop it until OCR replaces it.
     for p in result.pages_of_kind(PageKind.GARBLED):
         p.text = ""

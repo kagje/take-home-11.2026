@@ -51,6 +51,21 @@ SEARCH_TOP_K = 8
 SEARCH_CANDIDATES = 50  # per retriever, before fusion
 RRF_K = 60  # standard constant from the Reciprocal Rank Fusion paper
 
+# --- Agent --------------------------------------------------------------------
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "low")  # luna default is "medium"; low keeps latency down
+MAX_AGENT_STEPS = 8  # model calls per user turn; the last one is forced to answer
+READ_PAGES_MAX = 6  # pages per read_pages call
+TOOL_OUTPUT_MAX_TOKENS = 12_000  # truncate any single text tool result
+VIEW_PAGE_DPI = 150
+SHOW_USAGE = os.getenv("SHOW_USAGE", "1") == "1"  # tokens + cost footer under each answer
+
+# USD per 1M tokens (input, cached input, output); used for the cost footer.
+PRICES = {
+    "gpt-6-luna": (0.10, 0.01, 0.50),
+    "gpt-6.1-terra": (1.00, 0.05, 5.00),
+    "gpt-5-mini": (0.25, 0.025, 2.00),
+}
+
 # --- OCR ----------------------------------------------------------------------
 # Hard cap on vision-OCR pages per document, to bound cost and latency.
 MAX_OCR_PAGES = 40
